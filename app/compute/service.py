@@ -17,6 +17,9 @@ def digest(value: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+ALLOWED_PARAMETER_TYPES = {"integer", "number", "string", "boolean"}
+
+
 class ComputeOperationsService:
     """管理计算模板、配额、任务租约、结果版本和人工干预。"""
 
@@ -29,10 +32,12 @@ class ComputeOperationsService:
         return self.repository.active_templates()
 
     def create_template(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
-        self._validate_schema(payload["parameter_schema"], payload["default_parameters"])
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
+            # 与任务提交使用同一套类型、必填、范围和选项校验，并与插入放在同一事务中，
+            # 校验失败时整体回滚，不留下半成品模板或审计记录。
+            self._validate_template_definition(payload["parameter_schema"], payload["default_parameters"])
             if repository.template_by_code(payload["code"]):
                 raise ConflictError("参数模板编码已存在")
             return repository.create_template(
@@ -249,19 +254,53 @@ class ComputeOperationsService:
             raise ConflictError("用户当日提交配额已用尽")
 
     @staticmethod
-    def _validate_schema(schema: dict[str, dict[str, Any]], defaults: dict[str, Any]) -> None:
+    def _validate_template_definition(schema: dict[str, dict[str, Any]], defaults: dict[str, Any]) -> None:
         if not schema:
             raise ValidationError("参数模板至少包含一个参数")
-        allowed = {"integer", "number", "string", "boolean"}
         for name, rule in schema.items():
-            if not name or not isinstance(rule, dict) or rule.get("type") not in allowed:
-                raise ValidationError(f"参数 {name or '<empty>'} 的规则不合法")
-        if set(defaults) - set(schema):
-            raise ValidationError("默认值包含未声明参数")
+            ComputeOperationsService._validate_rule(name, rule)
+        unknown = set(defaults) - set(schema)
+        if unknown:
+            raise ValidationError("默认值包含未声明参数", context={"parameters": sorted(unknown)})
+        # 默认值必须通过与任务提交完全相同的类型、范围和选项校验。
+        for name, value in defaults.items():
+            ComputeOperationsService._validate_value(name, schema[name], value)
+
+    @staticmethod
+    def _validate_rule(name: str, rule: dict[str, Any]) -> None:
+        label = name or "<empty>"
+        if not name or not isinstance(rule, dict) or rule.get("type") not in ALLOWED_PARAMETER_TYPES:
+            raise ValidationError(f"参数 {label} 的规则不合法", context={"parameter": name})
+        kind = rule["type"]
+        required = rule.get("required")
+        if required is not None and not isinstance(required, bool):
+            raise ValidationError(f"参数 {label} 的必填标记不合法", context={"parameter": name})
+        numeric = kind in {"integer", "number"}
+        for bound in ("minimum", "maximum"):
+            value = rule.get(bound)
+            if value is None:
+                continue
+            if not numeric:
+                raise ValidationError(f"参数 {label} 不允许设置{bound}", context={"parameter": name})
+            if not ComputeOperationsService._matches_type(value, kind):
+                raise ValidationError(f"参数 {label} 的{bound}类型不正确", context={"parameter": name})
+        minimum, maximum = rule.get("minimum"), rule.get("maximum")
+        if numeric and minimum is not None and maximum is not None and minimum > maximum:
+            raise ValidationError(f"参数 {label} 的最小值不能大于最大值", context={"parameter": name})
+        choices = rule.get("choices")
+        if choices is not None:
+            if not isinstance(choices, list) or not choices:
+                raise ValidationError(f"参数 {label} 的选项列表不合法", context={"parameter": name})
+            for option in choices:
+                if not ComputeOperationsService._matches_type(option, kind):
+                    raise ValidationError(f"参数 {label} 的选项类型与声明不一致", context={"parameter": name})
 
     def _validate_parameters(self, template: sqlite3.Row, supplied: dict[str, Any]) -> dict[str, Any]:
         schema = json.loads(template["parameter_schema_json"])
         values = {**json.loads(template["default_parameters_json"]), **supplied}
+        return self._validate_against_schema(schema, values)
+
+    def _validate_against_schema(self, schema: dict[str, dict[str, Any]], values: dict[str, Any]) -> dict[str, Any]:
         unknown = set(values) - set(schema)
         if unknown:
             raise ValidationError("包含模板未声明的参数", context={"parameters": sorted(unknown)})
@@ -269,18 +308,30 @@ class ComputeOperationsService:
         for name, rule in schema.items():
             if name not in values:
                 if rule.get("required"):
-                    raise ValidationError(f"缺少必填参数：{name}")
+                    raise ValidationError(f"缺少必填参数：{name}", context={"parameter": name})
                 continue
-            value = values[name]
-            kind = rule["type"]
-            valid = {"integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool), "string": isinstance(value, str), "boolean": isinstance(value, bool)}[kind]
-            if not valid:
-                raise ValidationError(f"参数 {name} 类型不正确")
-            if rule.get("minimum") is not None and value < rule["minimum"]:
-                raise ValidationError(f"参数 {name} 小于允许的最小值")
-            if rule.get("maximum") is not None and value > rule["maximum"]:
-                raise ValidationError(f"参数 {name} 大于允许的最大值")
-            if rule.get("choices") and value not in rule["choices"]:
-                raise ValidationError(f"参数 {name} 不在允许的选项中")
-            normalized[name] = value
+            normalized[name] = self._validate_value(name, rule, values[name])
         return normalized
+
+    @staticmethod
+    def _matches_type(value: Any, kind: str) -> bool:
+        if kind == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if kind == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if kind == "string":
+            return isinstance(value, str)
+        return isinstance(value, bool)
+
+    @staticmethod
+    def _validate_value(name: str, rule: dict[str, Any], value: Any) -> Any:
+        kind = rule["type"]
+        if not ComputeOperationsService._matches_type(value, kind):
+            raise ValidationError(f"参数 {name} 类型不正确", context={"parameter": name})
+        if rule.get("minimum") is not None and value < rule["minimum"]:
+            raise ValidationError(f"参数 {name} 小于允许的最小值", context={"parameter": name})
+        if rule.get("maximum") is not None and value > rule["maximum"]:
+            raise ValidationError(f"参数 {name} 大于允许的最大值", context={"parameter": name})
+        if rule.get("choices") and value not in rule["choices"]:
+            raise ValidationError(f"参数 {name} 不在允许的选项中", context={"parameter": name})
+        return value
