@@ -29,10 +29,18 @@ class ComputeOperationsService:
         return self.repository.active_templates()
 
     def create_template(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
-        self._validate_schema(payload["parameter_schema"], payload["default_parameters"])
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
+            schema = payload["parameter_schema"]
+            defaults = payload["default_parameters"]
+            # 与任务提交相同的校验必须在同一事务内完成：校验失败时事务回滚，
+            # 不会把半成品模板写入生产数据。
+            self._validate_schema_declarations(schema)
+            self._validate_parameter_values(
+                schema, defaults, enforce_required=False, undeclared_message="默认值包含未声明参数",
+                unknown_context_key="parameters",
+            )
             if repository.template_by_code(payload["code"]):
                 raise ConflictError("参数模板编码已存在")
             return repository.create_template(
@@ -249,26 +257,31 @@ class ComputeOperationsService:
             raise ConflictError("用户当日提交配额已用尽")
 
     @staticmethod
-    def _validate_schema(schema: dict[str, dict[str, Any]], defaults: dict[str, Any]) -> None:
+    def _validate_schema_declarations(schema: dict[str, dict[str, Any]]) -> None:
         if not schema:
             raise ValidationError("参数模板至少包含一个参数")
         allowed = {"integer", "number", "string", "boolean"}
         for name, rule in schema.items():
             if not name or not isinstance(rule, dict) or rule.get("type") not in allowed:
                 raise ValidationError(f"参数 {name or '<empty>'} 的规则不合法")
-        if set(defaults) - set(schema):
-            raise ValidationError("默认值包含未声明参数")
 
-    def _validate_parameters(self, template: sqlite3.Row, supplied: dict[str, Any]) -> dict[str, Any]:
-        schema = json.loads(template["parameter_schema_json"])
-        values = {**json.loads(template["default_parameters_json"]), **supplied}
+    @staticmethod
+    def _validate_parameter_values(
+        schema: dict[str, dict[str, Any]],
+        values: dict[str, Any],
+        *,
+        enforce_required: bool,
+        undeclared_message: str,
+        unknown_context_key: str | None = None,
+    ) -> dict[str, Any]:
         unknown = set(values) - set(schema)
         if unknown:
-            raise ValidationError("包含模板未声明的参数", context={"parameters": sorted(unknown)})
+            context = {unknown_context_key: sorted(unknown)} if unknown_context_key else None
+            raise ValidationError(undeclared_message, context=context)
         normalized: dict[str, Any] = {}
         for name, rule in schema.items():
             if name not in values:
-                if rule.get("required"):
+                if enforce_required and rule.get("required"):
                     raise ValidationError(f"缺少必填参数：{name}")
                 continue
             value = values[name]
@@ -284,3 +297,11 @@ class ComputeOperationsService:
                 raise ValidationError(f"参数 {name} 不在允许的选项中")
             normalized[name] = value
         return normalized
+
+    def _validate_parameters(self, template: sqlite3.Row, supplied: dict[str, Any]) -> dict[str, Any]:
+        schema = json.loads(template["parameter_schema_json"])
+        values = {**json.loads(template["default_parameters_json"]), **supplied}
+        return self._validate_parameter_values(
+            schema, values, enforce_required=True, undeclared_message="包含模板未声明的参数",
+            unknown_context_key="parameters",
+        )

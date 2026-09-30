@@ -38,6 +38,62 @@ def create_template(client) -> None:
     assert response.status_code == 201, response.text
 
 
+def test_template_creation_rejects_invalid_defaults_and_rolls_back(client):
+    bad = {**TEMPLATE, "default_parameters": {"tolerance": "0.001"}}
+    rejected = client.post("/api/compute/templates?actor=administrator", json=bad)
+    assert rejected.status_code == 422
+    body = rejected.json()["error"]
+    assert body["code"] == "validation_error"
+    assert "tolerance" in body["message"]
+    # 失败后不得留下半成品模板（列表不可见、编码可重新登记）。
+    assert client.get("/api/compute/templates").json()["items"] == []
+    retry_create = client.post("/api/compute/templates?actor=administrator", json=TEMPLATE)
+    assert retry_create.status_code == 201, retry_create.text
+
+
+def test_template_creation_validates_range_choices_and_undeclared_defaults(client):
+    out_of_range = {**TEMPLATE, "code": "tpl-range", "default_parameters": {"tolerance": 5.0}}
+    response = client.post("/api/compute/templates?actor=administrator", json=out_of_range)
+    assert response.status_code == 422 and "tolerance" in response.json()["error"]["message"]
+
+    bad_choice = {**TEMPLATE, "code": "tpl-choice", "default_parameters": {"mode": "turbo"}}
+    response = client.post("/api/compute/templates?actor=administrator", json=bad_choice)
+    assert response.status_code == 422 and "mode" in response.json()["error"]["message"]
+
+    undeclared = {**TEMPLATE, "code": "tpl-unknown", "default_parameters": {"ghost": 1}}
+    response = client.post("/api/compute/templates?actor=administrator", json=undeclared)
+    assert response.status_code == 422
+    assert response.json()["error"]["context"] == {"parameters": ["ghost"]}
+
+    # 全部失败请求都已回滚，没有任何模板落库。
+    assert client.get("/api/compute/templates").json()["items"] == []
+
+
+def test_rolled_back_failure_does_not_block_later_submission(client):
+    bad = {**TEMPLATE, "default_parameters": {"iterations": "100"}}
+    rejected = client.post("/api/compute/templates?actor=administrator", json=bad)
+    assert rejected.status_code == 422
+    create_template(client)
+    # 模板注册成功后，任务提交、幂等重放与结果版本链保持原有行为。
+    first = client.post("/api/compute/tasks", json=submit_payload("submit-after-rollback-01"))
+    assert first.status_code == 202, first.text
+    replay = client.post("/api/compute/tasks", json=submit_payload("submit-after-rollback-01"))
+    assert replay.status_code == 202 and replay.json()["id"] == first.json()["id"]
+
+    claimed = client.post(
+        "/api/compute/tasks/claim", json={"worker_id": "w1", "capabilities": ["solver-a"], "lease_seconds": 60}
+    ).json()["task"]
+    complete = client.post(
+        f"/api/compute/tasks/{claimed['id']}/complete",
+        json={"worker_id": "w1", "result": {"value": 1.0}, "metrics": {}},
+    )
+    assert complete.status_code == 200
+    details = client.get(f"/api/compute/task-details/{claimed['id']}").json()
+    assert details["status"] == "succeeded"
+    assert details["current_result_version"] == 1
+    assert [version["version"] for version in details["results"]] == [1]
+
+
 def test_template_submission_idempotency_and_parameter_validation(client):
     create_template(client)
     first = client.post("/api/compute/tasks", json=submit_payload("request-000001"))
